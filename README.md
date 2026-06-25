@@ -200,6 +200,7 @@ shows an **Output Tokens Saved** card next to input compression, labelled
 | OpenClaw     | ✅              | installs as ContextEngine plugin |
 | OpenCode     | ✅              | injects config · starts proxy + launches |
 | Cortex Code  | ✅              | 60–65% savings · library mode   |
+| Kimi CLI     | ✅              | OAuth bearer forwarded — log in once |
 
 Any OpenAI-compatible client works via `headroom proxy`. MCP-native: `headroom mcp install`.
 
