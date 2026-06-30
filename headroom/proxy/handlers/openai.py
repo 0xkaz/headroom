@@ -69,6 +69,11 @@ _OPENAI_RESPONSES_UNIT_EXECUTOR_LOCK = threading.RLock()
 _OPENAI_RESPONSES_UNIT_EXECUTOR: ThreadPoolExecutor | None = None
 _WS_ALLOWED_ORIGINS_ENV = "HEADROOM_WS_ORIGINS"
 _CORS_ALLOWED_ORIGINS_ENV = "HEADROOM_CORS_ORIGINS"
+_CODEX_RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite"
+_OPENAI_CHAT_COMPLETIONS_PATH = "/chat/completions"
+_OPENAI_RESPONSES_PATH = "/responses"
+_OPENAI_ORIGINAL_PATH_HEADER = "x-headroom-original-path"
+_OPENAI_BASE_URL_HEADER = "x-headroom-base-url"
 
 
 def _header_get(headers: dict[str, str], name: str) -> str | None:
@@ -78,6 +83,51 @@ def _header_get(headers: dict[str, str], name: str) -> str | None:
         if key.lower() == lowered:
             return value
     return None
+
+
+def _resolve_openai_handler_path(
+    request_headers: dict[str, str],
+    *,
+    handler_path: str,
+) -> str:
+    raw_path = _header_get(request_headers, _OPENAI_ORIGINAL_PATH_HEADER)
+    upstream_path = raw_path.strip() if raw_path is not None else None
+
+    default_path = f"/v1{handler_path}"
+    if upstream_path is None:
+        return default_path
+
+    if not upstream_path.startswith("/") or upstream_path.startswith("//"):
+        return default_path
+
+    parsed = urlparse(upstream_path)
+    if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment:
+        return default_path
+
+    if not parsed.path.endswith(handler_path):
+        return f"/v1{handler_path}"
+
+    return parsed.path
+
+
+def _resolve_openai_upstream_base(request_headers: dict[str, str]) -> str | None:
+    raw_base_url = _header_get(request_headers, _OPENAI_BASE_URL_HEADER)
+    if raw_base_url is None:
+        return None
+
+    normalized = _normalize_origin(raw_base_url)
+    if normalized is None:
+        return None
+    if urlparse(normalized).scheme not in {"http", "https"}:
+        return None
+    return normalized
+
+
+def _append_request_query(url: str, query: str) -> str:
+    if not query:
+        return url
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}{query}"
 
 
 def _normalize_origin(origin: str) -> str | None:
@@ -2485,7 +2535,19 @@ class OpenAIHandlerMixin:
                 )
 
         # Direct OpenAI API (no backend configured)
-        url = build_copilot_upstream_url(self.OPENAI_API_URL, "/v1/chat/completions")
+        upstream_base_url = _resolve_openai_upstream_base(request.headers)
+        handler_path = (
+            _resolve_openai_handler_path(
+                request.headers, handler_path=_OPENAI_CHAT_COMPLETIONS_PATH
+            )
+            if upstream_base_url is not None
+            else "/v1/chat/completions"
+        )
+        url = build_copilot_upstream_url(
+            upstream_base_url or self.OPENAI_API_URL,
+            handler_path,
+        )
+        url = _append_request_query(url, request.url.query)
 
         try:
             if stream:
@@ -3244,7 +3306,17 @@ class OpenAIHandlerMixin:
         if is_chatgpt_auth:
             url = "https://chatgpt.com/backend-api/codex/responses"
         else:
-            url = build_copilot_upstream_url(self.OPENAI_API_URL, "/v1/responses")
+            upstream_base_url = _resolve_openai_upstream_base(request.headers)
+            handler_path = (
+                _resolve_openai_handler_path(request.headers, handler_path=_OPENAI_RESPONSES_PATH)
+                if upstream_base_url is not None
+                else "/v1/responses"
+            )
+            url = build_copilot_upstream_url(
+                upstream_base_url or self.OPENAI_API_URL,
+                handler_path,
+            )
+            url = _append_request_query(url, request.url.query)
 
         # The standalone Rust proxy has native /v1/responses item handling,
         # but the default CLI runtime is this Python proxy. Compress the
@@ -3780,6 +3852,12 @@ class OpenAIHandlerMixin:
         )
 
         upstream_headers, is_chatgpt_auth = _resolve_codex_routing_headers(upstream_headers)
+        # OpenAI rejects newer Codex models when this client-only lite header leaks upstream.
+        upstream_headers = {
+            key: value
+            for key, value in upstream_headers.items()
+            if key.lower() != _CODEX_RESPONSES_LITE_HEADER
+        }
         _lower_headers = {k.lower(): v for k, v in upstream_headers.items()}
 
         # Build upstream WebSocket URL based on auth mode
@@ -6152,10 +6230,18 @@ class OpenAIHandlerMixin:
             if protect_analysis_context is not None:
                 pipeline_kwargs["protect_analysis_context"] = bool(protect_analysis_context)
 
-            result = self.openai_pipeline.apply(
-                messages=messages,
-                model=model,
-                **pipeline_kwargs,
+            # Offload the CPU-bound pipeline to the bounded compression executor
+            # (mirrors the request handlers above). Running apply() inline blocked
+            # the single event loop on a large payload, so even GET /health stalled
+            # until it finished (#718). The executor also enforces a timeout so a
+            # too-large body fails fast instead of hanging forever.
+            result = await self._run_compression_in_executor(
+                lambda: self.openai_pipeline.apply(
+                    messages=messages,
+                    model=model,
+                    **pipeline_kwargs,
+                ),
+                timeout=COMPRESSION_TIMEOUT_SECONDS,
             )
 
             return JSONResponse(
@@ -6173,6 +6259,23 @@ class OpenAIHandlerMixin:
                     "transforms_summary": result.transforms_summary,
                     "ccr_hashes": result.markers_inserted,
                 }
+            )
+        except TimeoutError:
+            logger.warning(
+                "Compression timed out after %.0fs (payload too large)",
+                COMPRESSION_TIMEOUT_SECONDS,
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": {
+                        "type": "compression_timeout",
+                        "message": (
+                            "Compression exceeded "
+                            f"{COMPRESSION_TIMEOUT_SECONDS:.0f}s; payload too large."
+                        ),
+                    }
+                },
             )
         except Exception as e:
             logger.exception("Compression failed: %s", e)

@@ -149,6 +149,18 @@ class AnthropicHandlerMixin:
             return tools
         return sorted(tools, key=cls._tool_sort_key)
 
+    @classmethod
+    def _tools_for_forwarding(
+        cls,
+        tools: list[dict[str, Any]] | None,
+        *,
+        preserve_order: bool,
+    ) -> list[dict[str, Any]] | None:
+        """Return upstream tools, preserving client order for passthrough requests."""
+        if preserve_order:
+            return tools
+        return cls._sort_tools_deterministically(tools)
+
     @staticmethod
     def _compress_latest_user_turn_images_cache_safe(
         messages: list[dict[str, Any]],
@@ -663,6 +675,7 @@ class AnthropicHandlerMixin:
                 request.headers.get("x-headroom-bypass", "").lower() == "true"
                 or request.headers.get("x-headroom-mode", "").lower() == "passthrough"
             )
+            preserve_tool_order = _bypass or not self.config.optimize
             if _bypass:
                 logger.info(f"[{request_id}] Bypass: skipping compression (header)")
 
@@ -1050,6 +1063,8 @@ class AnthropicHandlerMixin:
                     def should_skip_ccr_request_compression(
                         current_frozen_message_count: int,
                     ) -> bool:
+                        if is_token_mode(self.config.mode):
+                            return False
                         # If the tool is already present, CCR stays reversible even on frozen turns.
                         return (
                             self.config.ccr_inject_tool
@@ -1841,9 +1856,12 @@ class AnthropicHandlerMixin:
             # Update body
             body["messages"] = optimized_messages
             if tools or _original_tools is not None:
-                sorted_tools = self._sort_tools_deterministically(tools)
-                if sorted_tools != tools:
-                    tools = sorted_tools
+                forwarded_tools = self._tools_for_forwarding(
+                    tools,
+                    preserve_order=preserve_tool_order,
+                )
+                if forwarded_tools != tools:
+                    tools = forwarded_tools
                 if tools != _original_tools:
                     body["tools"] = tools
 
@@ -1863,11 +1881,10 @@ class AnthropicHandlerMixin:
                 optimized_messages = presend_event.messages
                 body["messages"] = optimized_messages
             if presend_event.tools is not None:
-                sorted_tools = self._sort_tools_deterministically(presend_event.tools)
-                if sorted_tools != presend_event.tools:
-                    tools = sorted_tools
-                else:
-                    tools = presend_event.tools
+                tools = self._tools_for_forwarding(
+                    presend_event.tools,
+                    preserve_order=preserve_tool_order,
+                )
                 if tools or body.get("tools") is not None:
                     if tools != body.get("tools"):
                         body["tools"] = tools
@@ -2895,10 +2912,6 @@ class AnthropicHandlerMixin:
             params = batch_req.get("params", {})
             canonical_params = dict(params)
             original_tools = canonical_params.get("tools")
-            if original_tools is not None:
-                sorted_tools = self._sort_tools_deterministically(original_tools)
-                if sorted_tools != original_tools:
-                    canonical_params["tools"] = sorted_tools
             messages = params.get("messages", [])
             original_messages = copy.deepcopy(messages)
             model = params.get("model", "unknown")
@@ -2912,6 +2925,11 @@ class AnthropicHandlerMixin:
                     }
                 )
                 continue
+
+            if original_tools is not None:
+                sorted_tools = self._sort_tools_deterministically(original_tools)
+                if sorted_tools != original_tools:
+                    canonical_params["tools"] = sorted_tools
 
             # Apply optimization
             original_tokens = 0  # Initialize before try to prevent UnboundLocalError
